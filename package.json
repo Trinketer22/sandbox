@@ -33,6 +33,7 @@
     "wasm:copy": "cp src/executor/emulator-emscripten.js src/executor/emulator-emscripten.wasm.js ./dist/executor",
     "test": "yarn wasm:pack && yarn jest src",
     "build": "rm -rf dist && yarn wasm:pack && yarn test && tsc && yarn wasm:copy",
-    "config:pack": "ts-node ./scripts/pack-config.ts"
+    "config:pack": "ts-node ./scripts/pack-config.ts",
+    "prepare": "npm run build"
   }
 }
