@@ -5,13 +5,12 @@ import {BlockchainStorage, LocalBlockchainStorage} from "./BlockchainStorage";
 import { extractEvents, Event } from "../event/Event";
 import { BlockchainContractProvider } from "./BlockchainContractProvider";
 import { BlockchainSender } from "./BlockchainSender";
-import { testKey } from "../utils/testKey";
 import { TreasuryContract } from "../treasury/Treasury";
 import { GetMethodParams, LogsVerbosity, MessageParams, SmartContract, SmartContractSnapshot, Verbosity } from "./SmartContract";
 import { AsyncLock } from "../utils/AsyncLock";
 import { internal } from "../utils/message";
 import { slimConfig } from "../config/slimConfig";
-import { KeyPair } from "ton-crypto";
+import { testSubwalletId } from "../utils/testTreasurySubwalletId";
 
 const CREATE_WALLETS_PREFIX = 'CREATE_WALLETS'
 
@@ -51,6 +50,8 @@ export type SendMessageResult = {
     externals: ExternalOut[],
 }
 
+type QueueCallback = (txs: BlockchainTransaction []) => Promise<void>;
+
 export type SandboxContract<F> = {
     [P in keyof F]: P extends `get${string}`
         ? (F[P] extends (x: ContractProvider, ...args: infer P) => infer R ? (...args: P) => R : never)
@@ -58,7 +59,9 @@ export type SandboxContract<F> = {
             ? (F[P] extends (x: ContractProvider, ...args: infer P) => infer R ? (...args: P) => Promise<SendMessageResult & {
                 result: R extends Promise<infer PR> ? PR : R
             }> : never)
-            : F[P]);
+            : (P extends 'runTickTock' ?
+                (F[P] extends (x: BlockchainContractProvider, ...args: infer P) => infer R ? (...args: P) => Promise<SendMessageResult> : never)
+                    : F[P]));
 }
 
 export type PendingMessage = Message & {
@@ -94,12 +97,6 @@ export type BlockchainSnapshot = {
     time?: number
     verbosity: LogsVerbosity
     libs?: Cell
-    treasuryStates: {
-        mapKey: string
-        workchain: number
-        keypair: KeyPair
-        seqno: number
-    }[]
     nextCreateWalletIndex: number
 }
 
@@ -118,7 +115,6 @@ export class Blockchain {
     protected globalLibs?: Cell
     protected lock = new AsyncLock()
     protected contractFetches = new Map<string, Promise<SmartContract>>()
-    protected treasuries = new Map<string, SandboxContract<TreasuryContract>>()
     protected nextCreateWalletIndex = 0
 
     readonly executor: Executor
@@ -131,7 +127,6 @@ export class Blockchain {
             time: this.currentTime,
             verbosity: { ...this.logsVerbosity },
             libs: this.globalLibs,
-            treasuryStates: Array.from(this.treasuries.entries()).map(t => ({ mapKey: t[0], workchain: t[1].address.workChain, keypair: t[1].keypair, seqno: t[1].seqno })),
             nextCreateWalletIndex: this.nextCreateWalletIndex,
         }
     }
@@ -148,12 +143,6 @@ export class Blockchain {
         this.currentTime = snapshot.time
         this.logsVerbosity = { ...snapshot.verbosity }
         this.globalLibs = snapshot.libs
-        this.treasuries.clear()
-        for (const ts of snapshot.treasuryStates) {
-            const tc = TreasuryContract.create(ts.workchain, ts.keypair)
-            tc.seqno = ts.seqno
-            this.treasuries.set(ts.mapKey, this.openContract(tc))
-        }
         this.nextCreateWalletIndex = snapshot.nextCreateWalletIndex
     }
 
@@ -195,6 +184,58 @@ export class Blockchain {
         })
     }
 
+    async runTickTock(address: Address, isTock: boolean, params?: MessageParams) {
+        // Quick and dirty implementation
+        params = {
+            now: this.now,
+            ...params,
+        };
+
+        return await this.runQueue(params, async (txes: BlockchainTransaction[] ) => {
+            this.currentLt += LT_ALIGN;
+            const Smc = await this.getContract(address);
+            const res = await Smc.runTickTock(isTock, params);
+            const tt  = await this.chainTransaction({
+                ...res,
+                events: extractEvents(res),
+                children: [],
+                externals: [],
+            });
+            txes.push(tt);
+        });
+    }
+
+    // Generic transaction chaining
+    protected async chainTransaction(transaction: BlockchainTransaction) {
+        transaction.parent?.children.push(transaction)
+        for (const message of transaction.outMessages.values()) {
+            if (message.info.type === 'external-out') {
+                transaction.externals.push({
+                    info: {
+                        type: 'external-out',
+                        src: message.info.src,
+                        dest: message.info.dest ?? undefined,
+                        createdAt: message.info.createdAt,
+                        createdLt: message.info.createdLt,
+                    },
+                    init: message.init ?? undefined,
+                    body: message.body,
+                })
+                continue
+            }
+
+            this.messageQueue.push({
+                ...message,
+                parentTransaction: transaction,
+            })
+
+            if (message.info.type === 'internal') {
+                this.startFetchingContract(message.info.dest)
+            }
+        }
+        return transaction;
+    }
+
     protected async pushMessage(message: Message | Cell) {
         const msg = message instanceof Cell ? loadMessage(message.beginParse()) : message
         if (msg.info.type === 'external-out') {
@@ -205,8 +246,8 @@ export class Blockchain {
         })
     }
 
-    protected async runQueue(params?: MessageParams): Promise<SendMessageResult>  {
-        const txes = await this.processQueue(params)
+    protected async runQueue(params?: MessageParams, pre?:QueueCallback, post?:QueueCallback): Promise<SendMessageResult>  {
+        const txes = await this.processQueue(params, pre, post)
         return {
             transactions: txes,
             events: txes.map(tx => tx.events).flat(),
@@ -214,13 +255,17 @@ export class Blockchain {
         }
     }
 
-    protected async processQueue(params?: MessageParams) {
+    protected async processQueue(params?: MessageParams, pre?: QueueCallback, post?: QueueCallback) {
         params = {
             now: this.now,
             ...params,
         }
         return await this.lock.with(async () => {
             const result: BlockchainTransaction[] = []
+
+            if(pre) {
+                await pre(result);
+            }
 
             while (this.messageQueue.length > 0) {
                 const message = this.messageQueue.shift()!
@@ -238,35 +283,11 @@ export class Blockchain {
                     children: [],
                     externals: [],
                 }
-                transaction.parent?.children.push(transaction)
+                result.push(await this.chainTransaction(transaction));
+            }
 
-                result.push(transaction)
-
-                for (const message of transaction.outMessages.values()) {
-                    if (message.info.type === 'external-out') {
-                        transaction.externals.push({
-                            info: {
-                                type: 'external-out',
-                                src: message.info.src,
-                                dest: message.info.dest ?? undefined,
-                                createdAt: message.info.createdAt,
-                                createdLt: message.info.createdLt,
-                            },
-                            init: message.init ?? undefined,
-                            body: message.body,
-                        })
-                        continue
-                    }
-
-                    this.messageQueue.push({
-                        ...message,
-                        parentTransaction: transaction,
-                    })
-
-                    if (message.info.type === 'internal') {
-                        this.startFetchingContract(message.info.dest)
-                    }
-                }
+            if(post) {
+                await post(result);
             }
 
             return result
@@ -278,6 +299,7 @@ export class Blockchain {
             getContract: (addr) => this.getContract(addr),
             pushMessage: (msg) => this.pushMessage(msg),
             runGetMethod: (addr, method, args) => this.runGetMethod(addr, method, args),
+            runTickTock: (addr, isTock) => this.runTickTock(addr, isTock)
         }, address, init)
     }
 
@@ -292,15 +314,8 @@ export class Blockchain {
     }
 
     async treasury(seed: string, params?: TreasuryParams) {
-        const workchain = params?.workchain ?? 0
-        const mapKey = this.treasuryParamsToMapKey(workchain, seed)
-        let wallet = this.treasuries.get(mapKey)
-        if (wallet === undefined) {
-            const key = testKey(seed)
-            const treasury = TreasuryContract.create(params?.workchain ?? 0, key)
-            wallet = this.openContract(treasury)
-            this.treasuries.set(mapKey, wallet)
-        }
+        const subwalletId = testSubwalletId(seed)
+        const wallet = this.openContract(TreasuryContract.create(params?.workchain ?? 0, subwalletId))
 
         const contract = await this.getContract(wallet.address)
         if ((params?.predeploy ?? true) && (contract.accountState === undefined || contract.accountState.type === 'uninit')) {
@@ -369,6 +384,11 @@ export class Blockchain {
                                     result: ret,
                                 }
                             }
+                        }
+                    } else if( prop == 'runTickTock' ) {
+                        return async (...args: any[]) => {
+                           const ret = value.apply(target, [provider, ...args])
+                           return ret instanceof Promise ? await ret : ret;
                         }
                     }
                 }

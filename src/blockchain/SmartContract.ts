@@ -102,7 +102,7 @@ export type TickTockParams = Partial<{
     isTock: boolean
 }>
 
-export type TransactionOpts = {message?: Message} & MessageParams & TickTockParams;
+export type TransactionParams = {message?: Message} & MessageParams & TickTockParams;
 
 export type GetMethodParams = Partial<{
     now: number,
@@ -230,7 +230,7 @@ export class SmartContract {
         return new SmartContract(createEmptyShardAccount(address), blockchain)
     }
 
-    protected runTransaction(params: TransactionOpts) {
+    protected runTransaction(params: TransactionParams) {
         const now = params.now ?? Math.floor(Date.now() / 1000)
         if (now < this.#lastTxTime) {
             throw new TimeError(this.address, this.#lastTxTime, now)
@@ -249,7 +249,8 @@ export class SmartContract {
             randomSeed: params.randomSeed ?? Buffer.alloc(32),
             ignoreChksig: params.ignoreChksig ?? false,
             isTickTock: params.isTickTock ?? false,
-            isTock: params.isTickTock ? params.isTock : false
+            isTock: params.isTickTock ? params.isTock : false,
+            debugEnabled: this.verbosity.debugLogs,
         })
 
         if (this.verbosity.print && this.verbosity.blockchainLogs && res.logs.length > 0) {
@@ -324,6 +325,7 @@ export class SmartContract {
             balance: this.balance,
             randomSeed: params?.randomSeed ?? Buffer.alloc(32),
             gasLimit: params?.gasLimit ?? 10_000_000n,
+            debugEnabled: this.verbosity.debugLogs,
         })
 
         if (this.verbosity.print && this.verbosity.blockchainLogs && res.logs.length > 0) {
