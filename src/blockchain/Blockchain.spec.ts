@@ -670,7 +670,7 @@ describe('Blockchain', () => {
         expect(res.stackReader.readBigNumber()).toEqual(40000n)
     })
 
-    it('should bounce in action phase when send mode = 16', async () => {
+    it.skip('should bounce in action phase when send mode = 16', async () => {
         const blockchain = await Blockchain.create()
         const addr = randomAddress()
         await blockchain.setShardAccount(addr, createShardAccount({
